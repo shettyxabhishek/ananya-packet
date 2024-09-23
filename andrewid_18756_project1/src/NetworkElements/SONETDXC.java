@@ -1,5 +1,6 @@
 package NetworkElements;
 
+import java.security.DrbgParameters;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -55,8 +56,26 @@ public class SONETDXC extends Switch {
 	public void receivePackets(Packet packet, int wavelength, OpticalNIC nic) {
 		if (packet instanceof STS1Packet) {
 
-		} else {
+			STS1Packet sts1Packet = (STS1Packet) packet;
 
+			if (dropFrequency.contains(wavelength)) {
+				this.sink(sts1Packet, wavelength);
+			} else {
+				this.sendBuffer.add(sts1Packet);
+			}
+
+		} else if (packet instanceof STS3Packet) {
+			// Unpack STS3 into STS1 packets and buffer them for later
+			STS3Packet sts3Packet = (STS3Packet) packet;
+			List<STS1Packet> sts1Packets = sts3Packet.getPackets(); // Assume unpack returns an array
+
+			for (STS1Packet sts1 : sts1Packets) {
+				if (sts1 != null) {
+					this.sendBuffer.add(sts1); // Buffer each unpacked STS1 packet
+				}
+			}
+		} else {
+			System.out.println("Packet type not recognized.");
 		}
 	}
 
@@ -77,38 +96,52 @@ public class SONETDXC extends Switch {
 
 			// which means the DXC is the source of this STS-1 Packet
 			if (nic == null) {
-
+				System.out.println("Skipping NIC");
 			}
 			// transfer packet, to the shortest path first
 			if (NIC.getIsOnRing() && !NIC.equals(nic)) {
-
+				NIC.sendPacket(packet, wavelength);
 			}
 		}
 	}
 
 	/**
-	 * Send out the packets from buffer, form STS3Packets and send to NICs
+	 * Send out the packets from buffer, form STS3Packets and send to NICs.
+	 * Packets are grouped in threes to form STS3 packets.
+	 * If there are fewer than 3 packets, the missing packets are filled with null.
 	 */
 	public void sendPackets() {
-		Map<Integer, List<STS1Packet>> destPackets = new HashMap<>();
+		Map<Integer, List<STS1Packet>> packetsByDestination = new HashMap<>();
+
+		// Group packets in the buffer by destination
 		while (!this.sendBuffer.isEmpty()) {
-			STS1Packet pkt = this.sendBuffer.remove();
-			destPackets.computeIfAbsent(pkt.getDest(), k -> new ArrayList<>()).add(pkt);
+			STS1Packet packet = this.sendBuffer.remove();
+			packetsByDestination.computeIfAbsent(packet.getDest(), k -> new ArrayList<>()).add(packet);
 		}
 
-		for (Map.Entry<Integer, List<STS1Packet>> entry : destPackets.entrySet()) {
-			List<STS1Packet> pkts = entry.getValue();
-			for (int i = 0; i < pkts.size(); i += 3) {
-				STS1Packet sts1 = null, sts2 = null, sts3 = null;
-				sts1 = pkts.get(i);
-				if (i + 1 < pkts.size())
-					sts2 = pkts.get(i + 1);
-				if (i + 2 < pkts.size())
-					sts3 = pkts.get(i + 2);
-				this.sendRingPacket(new STS3Packet(sts1, sts2, sts3), entry.getKey(), null);
+		System.out.println(packetsByDestination);
+
+		// Create and send STS3 packets for each destination
+		for (Map.Entry<Integer, List<STS1Packet>> entry : packetsByDestination.entrySet()) {
+			List<STS1Packet> packetList = entry.getValue();
+
+			// Convert destination Integer to String (because destinationFrequencies is
+			// TreeMap<String, Integer>)
+			int wavelength = entry.getKey();
+
+			System.out.println("Desitination Wavelength: " + wavelength);
+
+			// Group packets into sets of 3 to form STS3 packets
+			for (int i = 0; i < packetList.size(); i += 3) {
+				STS1Packet pkt1 = packetList.get(i);
+				STS1Packet pkt2 = (i + 1 < packetList.size()) ? packetList.get(i + 1) : null;
+				STS1Packet pkt3 = (i + 2 < packetList.size()) ? packetList.get(i + 2) : null;
+
+				// Create the STS3 packet and send it out
+				STS3Packet sts3Packet = new STS3Packet(pkt1, pkt2, pkt3);
+				this.sendRingPacket(sts3Packet, wavelength, null);
 			}
 		}
-
 	}
 
 	/**
@@ -119,14 +152,19 @@ public class SONETDXC extends Switch {
 	 * 
 	 * @param payload to put in the buffer
 	 */
-	public void create(STS1Packet payload) {
+	public void create(STS1Packet packet) {
 		int sourceWavelength = destinationFrequencies.get(address);
-		payload.setSource(sourceWavelength);
+		packet.setSource(sourceWavelength);
 
 		System.out
-				.println("(SONET DXC) " + address + " has created a STS1Packet from wavelength " + payload.getSource() +
-						" to " + payload.getDest() + "with payload" + payload.getPayload());
-		this.checkSegmentation(payload);
+				.println("(SONET DXC) " + address + " has created a STS1Packet from wavelength " + packet.getSource() +
+						" to " + packet.getDest() + " with payload " + packet.getPayload());
+		this.checkSegmentation(packet);
+		System.out.println("Buffer size: " + this.sendBuffer.size());
+
+		for (STS1Packet x : this.sendBuffer) {
+			System.out.println(x);
+		}
 	}
 
 	/**
@@ -136,9 +174,26 @@ public class SONETDXC extends Switch {
 	 * 
 	 * @param payload to put in the buffer
 	 */
-	public void checkSegmentation(STS1Packet payload) {
+	public void checkSegmentation(STS1Packet packet) {
 		// TODO: Need to check segmentation for char_length>5 (3b)
-		this.sendBuffer.add(payload);
+
+		final int MAX_LEN = 5;
+
+		String payloadString = packet.getPayload();
+		int payloadLength = payloadString.length();
+
+		/*
+		 * Split the bigger payload into multiple STS1 frames and add to the DXC buffer
+		 * for processing
+		 */
+
+		for (int i = 0; i < payloadLength; i += MAX_LEN) {
+			String payloadSegment = payloadString.substring(i, Math.min(i + MAX_LEN, payloadLength));
+			STS1Packet newSTS1Packet = new STS1Packet(payloadSegment, packet.getDest());
+			System.out.println(newSTS1Packet);
+			this.sendBuffer.add(newSTS1Packet);
+
+		}
 	}
 
 	/**
